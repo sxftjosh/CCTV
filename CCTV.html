@@ -1,0 +1,282 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<titles> CCTV </titles></title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body{background:#0b0b0f;color:#eee;font-family:system-ui,Arial;margin:0;padding:12px;display:flex;flex-direction:column;align-items:center;gap:12px}
+  h1{font-size:18px;margin:0}
+  #stage{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start}
+  video, canvas{border:1px solid #333;max-width:100%;background:#000}
+  .controls{display:flex;gap:8px;align-items:center}
+  button{padding:8px 12px;border-radius:8px;border:0;background:#2563eb;color:white;font-weight:700;cursor:pointer}
+  button.secondary{background:#374151}
+  .screens{display:flex;gap:8px;flex-wrap:wrap;max-width:100%}
+  .log{font-size:13px;color:#9ca3af}
+</style>
+</head>
+<body>
+  <h1>CCTV</h1>
+  <div class="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" class="secondary" disabled>Stop</button>
+    <label style="margin-left:8px"><input id="alarmToggle" type="checkbox" checked/> Bell on detect</label>
+    <label style="margin-left:8px">Threshold <input id="thresh" type="range" min="0.2" max="0.95" step="0.05" value="0.55"/></label>
+  </div>
+
+  <div id="stage">
+    <div style="flex:1;min-width:320px">
+      <video id="preview" autoplay playsinline muted></video>
+      <canvas id="overlay" style="display:none"></canvas>
+    </div>
+    <div style="width:320px">
+      <div class="log"><b>Status:</b> <span id="status">idle</span></div>
+      <div class="log"><b>Humans detected:</b> <span id="count">0</span></div>
+      <div class="log"><b>Buffer target:</b> <span id="bufferLen">20</span> sec</div>
+      <div style="margin-top:10px">
+        <audio id="bell" src="https://www.soundjay.com/button/sounds/bell-ringing-05.mp3" preload="auto"></audio>
+      </div>
+    </div>
+  </div>
+
+  <h3>Saved Clips (last actions)</h3>
+  <div id="clips" class="screens"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+<script>
+(async function(){
+  // Config
+  const BUFFER_SECONDS = 20;            // how many seconds to keep in circular buffer
+  const TIMESLICE_MS = 1000;            // MediaRecorder timeslice per blob (1s)
+  const MIN_INTERVAL_MS = 3000;         // min interval between saved clips
+  const DETECT_SCORE = 0.55;            // default threshold (can change via slider)
+
+  // DOM
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const preview  = document.getElementById('preview');
+  const overlay  = document.getElementById('overlay');
+  const statusEl = document.getElementById('status');
+  const countEl  = document.getElementById('count');
+  const clipsDiv = document.getElementById('clips');
+  const bell     = document.getElementById('bell');
+  const alarmToggle = document.getElementById('alarmToggle');
+  const threshEl = document.getElementById('thresh');
+  const bufferLenEl = document.getElementById('bufferLen');
+
+  bufferLenEl.textContent = BUFFER_SECONDS;
+
+  // Internal state
+  let stream = null;
+  let model = null;
+  let recorder = null;
+  let recStream = null;                 // stream provided to MediaRecorder (canvas capture)
+  let blobBuffer = [];                  // circular buffer of recent blobs {blob, timestamp}
+  let lastSaveMs = 0;
+  let detecting = false;
+  let rafId = null;
+
+  // We'll draw the camera frames + timestamp onto a canvas, and record the canvas stream.
+  // This way saved video has timestamp overlay.
+  function setupCanvasSize() {
+    const w = preview.videoWidth || 640;
+    const h = preview.videoHeight || 480;
+    overlay.width = w;
+    overlay.height = h;
+    overlay.style.display = 'block';
+  }
+
+  // Start camera + model + MediaRecorder
+  async function startAll(){
+    startBtn.disabled = true;
+    statusEl.textContent = 'initializing camera...';
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    } catch (e) {
+      alert('Camera permission/error: ' + e.message);
+      startBtn.disabled = false;
+      return;
+    }
+
+    preview.srcObject = stream;
+    await preview.play();
+    setupCanvasSize();
+
+    statusEl.textContent = 'loading model...';
+    model = await cocoSsd.load({base:'lite_mobilenet_v2'});
+    statusEl.textContent = 'model loaded';
+
+    // Canvas capture (we'll overlay timestamp)
+    const canvas = overlay;
+    const ctx = canvas.getContext('2d');
+
+    recStream = canvas.captureStream(25); // 25 fps approx
+
+    // MediaRecorder for canvas stream
+    const options = { mimeType: 'video/webm;codecs=vp8' };
+    try {
+      recorder = new MediaRecorder(recStream, options);
+    } catch (e) {
+      alert('MediaRecorder unsupported or options not supported: ' + e.message);
+      startBtn.disabled = false;
+      return;
+    }
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        // push with timestamp
+        blobBuffer.push({ blob: ev.data, ts: Date.now() });
+        // trim buffer to BUFFER_SECONDS
+        trimBuffer();
+      }
+    };
+
+    recorder.onstart = () => { statusEl.textContent = 'recording buffer...'; };
+    recorder.onstop = () => { statusEl.textContent = 'recorder stopped'; };
+
+    // start recording with a timeslice to get regular blobs
+    recorder.start(TIMESLICE_MS);
+
+    // start detection loop: draw into canvas and run detection
+    detecting = true;
+    function drawAndDetect(){
+      // draw latest video frame into canvas + timestamp
+      ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+      const now = new Date();
+      const ts = now.toLocaleString();
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(8, canvas.height - 36, ctx.measureText(ts).width + 16, 28);
+      ctx.fillStyle = 'yellow';
+      ctx.font = '18px system-ui, Arial';
+      ctx.fillText(ts, 12, canvas.height - 14);
+
+      // run detection on video element (faster than on-canvas)
+      model.detect(preview).then(preds => {
+        const th = parseFloat(threshEl.value);
+        const persons = preds.filter(p=>p.class === 'person' && p.score >= th);
+        countEl.textContent = persons.length;
+        if (persons.length > 0) {
+          // alarm + save last 20s (throttled)
+          const nowms = Date.now();
+          if (alarmToggle.checked) {
+            try { bell.currentTime = 0; bell.play().catch(()=>{}); } catch(e){}
+          }
+          if (nowms - lastSaveMs > MIN_INTERVAL_MS) {
+            lastSaveMs = nowms;
+            saveLastBuffer(); // async save
+          }
+        }
+      }).catch(e=>{ console.warn('detect err', e); });
+
+      rafId = requestAnimationFrame(drawAndDetect);
+    }
+    drawAndDetect();
+
+    stopBtn.disabled = false;
+    statusEl.textContent = 'running';
+  }
+
+  function stopAll(){
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    statusEl.textContent = 'stopping...';
+    detecting = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop();
+    }
+    // Stop tracks
+    if (stream) {
+      stream.getTracks().forEach(t=>t.stop());
+      stream = null;
+    }
+    // clear buffer
+    blobBuffer = [];
+    statusEl.textContent = 'stopped';
+  }
+
+  // Keep only recent BUFFER_SECONDS worth of blobs
+  function trimBuffer(){
+    const cutoff = Date.now() - BUFFER_SECONDS * 1000;
+    // blobBuffer is array of {blob, ts}
+    while (blobBuffer.length && blobBuffer[0].ts < cutoff) {
+      blobBuffer.shift();
+    }
+    // extra safety: cap length to BUFFER_SECONDS * 2 (if small timeslice)
+    const maxLen = Math.ceil(BUFFER_SECONDS * 1000 / Math.max(100, TIMESLICE_MS)) + 5;
+    if (blobBuffer.length > maxLen) blobBuffer.splice(0, blobBuffer.length - maxLen);
+  }
+
+  // Save the buffered blobs covering last ~BUFFER_SECONDS as a single webm
+  async function saveLastBuffer(){
+    if (!blobBuffer.length) { console.warn('buffer empty'); return; }
+    statusEl.textContent = 'saving last ' + BUFFER_SECONDS + 's...';
+
+    // Determine which blobs to include: take from end backwards until cumulative >= BUFFER_SECONDS
+    let selected = [];
+    let cumMs = 0;
+    // approximate each blob as TIMESLICE_MS (last one may be shorter)
+    for (let i = blobBuffer.length - 1; i >= 0; i--) {
+      selected.unshift(blobBuffer[i].blob);
+      cumMs += TIMESLICE_MS;
+      if (cumMs >= BUFFER_SECONDS * 1000) break;
+    }
+
+    // Merge blobs into one
+    const superBlob = new Blob(selected, { type: selected[0].type || 'video/webm' });
+
+    // Build filename with timestamp
+    const now = new Date();
+    const fname = 'clip_' + now.toISOString().replace(/[:.]/g,'-') + '.webm';
+
+    // Create download link and auto-click
+    const url = URL.createObjectURL(superBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    a.textContent = fname;
+    // Show thumbnail preview
+    const thumb = document.createElement('video');
+    thumb.src = url;
+    thumb.controls = true;
+    thumb.width = 200;
+    thumb.style.border = '1px solid #666';
+    const label = document.createElement('div');
+    label.style.color = '#ccc';
+    label.style.fontSize = '12px';
+    label.textContent = new Date().toLocaleString();
+    const container = document.createElement('div');
+    container.style.display = 'inline-block';
+    container.style.margin = '6px';
+    container.appendChild(thumb);
+    container.appendChild(label);
+    clipsDiv.prepend(container);
+
+    // Auto-download (will prompt/save depending on browser)
+    // comment/uncomment next two lines if you prefer manual download
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 30000);
+
+    statusEl.textContent = 'saved ' + fname;
+  }
+
+  // Wire up UI
+  startBtn.addEventListener('click', startAll);
+  stopBtn.addEventListener('click', stopAll);
+  threshEl.addEventListener('input', ()=>{/* live */});
+
+  // Clean up on page unload
+  window.addEventListener('beforeunload', ()=>{ try{ stopAll(); }catch{} });
+
+  // hint: preload model to speed up when user clicks start
+  // (optional) model = await cocoSsd.load();
+
+})(); // IIFE
+</script>
+</body>
+</html>
